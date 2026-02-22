@@ -215,3 +215,46 @@ async def resolve_aqi_from_device(
     result["flagged_device_aqi"] = True
     result["raw_device_aqi"] = device_aqi
     return result
+
+# ---------------------------------------------------------------------------
+# Forecast — 6 hour air quality prediction (AI prevention feature)
+# ---------------------------------------------------------------------------
+
+FORECAST_URL = (
+    "https://air-quality-api.open-meteo.com/v1/air-quality"
+    "?latitude={lat}&longitude={lon}"
+    "&hourly=pm2_5,pm10,us_aqi"
+    "&forecast_days=1"
+)
+
+async def fetch_aqi_forecast(lat: float, lon: float) -> list | None:
+    """
+    Fetches hourly AQI forecast for the next 6 hours.
+    Returns list of hourly readings or None if call fails.
+    """
+    url = FORECAST_URL.format(lat=lat, lon=lon)
+    try:
+        async with httpx.AsyncClient(timeout=AQI_TIMEOUT) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            hourly = data.get("hourly", {})
+            times  = hourly.get("time", [])
+            aqis   = hourly.get("us_aqi", [])
+            pm25s  = hourly.get("pm2_5", [])
+            pm10s  = hourly.get("pm10", [])
+
+            forecast = []
+            for i in range(min(6, len(times))):
+                forecast.append({
+                    "time":  times[i],
+                    "aqi":   aqis[i]  if i < len(aqis)  else None,
+                    "pm2_5": pm25s[i] if i < len(pm25s) else None,
+                    "pm10":  pm10s[i] if i < len(pm10s) else None,
+                })
+            return forecast
+
+    except Exception as e:
+        print(f"[aqi_service] Forecast error: {e}")
+        return None

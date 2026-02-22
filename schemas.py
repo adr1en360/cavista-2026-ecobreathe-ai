@@ -34,3 +34,13 @@ class SymptomEntry(BaseModel):
     symptoms:       list[SymptomItem] = Field(default_factory=list)
     other_symptoms: list[SymptomItem] = Field(default_factory=list)
     notes:          Optional[str]     = Field(default=None, max_length=500)
+
+
+class OutcomeLabel(BaseModel):
+    """
+    User labels whether they had an asthma episode after a reading.
+    This is what trains the XGBoost model over time.
+    """
+    reading_id:  int
+    had_episode: bool
+    notes:       Optional[str] = Field(default=None, max_length=500)

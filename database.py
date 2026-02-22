@@ -34,6 +34,16 @@ async def init_db():
                 aqi_data   TEXT NOT NULL
             )
         """)
+        # inside init_db(), add this table:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS outcome_labels (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                reading_id  INTEGER NOT NULL,
+                labeled_at  TEXT NOT NULL,
+                had_episode INTEGER NOT NULL,
+                notes       TEXT
+            )
+        """)
         await db.commit()
 
 
@@ -157,3 +167,67 @@ async def get_last_known_aqi() -> dict | None:
         if not row:
             return None
         return json.loads(row["aqi_data"])
+
+
+# ---------------------------------------------------------------------------
+# Outcome labels — XGBoost training data
+# ---------------------------------------------------------------------------
+
+async def save_outcome_label(reading_id: int, had_episode: bool, notes: str = None) -> int:
+    """
+    User labels whether they had an asthma episode after a reading.
+    This is the training target for the XGBoost model.
+    had_episode: True = episode occurred, False = no episode
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO outcome_labels (reading_id, labeled_at, had_episode, notes) VALUES (?, ?, ?, ?)",
+            (
+                reading_id,
+                datetime.now(timezone.utc).isoformat(),
+                1 if had_episode else 0,
+                notes,
+            )
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_training_data(limit: int = 500) -> list:
+    """
+    Joins sensor readings with outcome labels.
+    Returns structured training records ready for XGBoost.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                sr.id,
+                sr.timestamp,
+                sr.sensor_data,
+                sr.risk_data,
+                ol.had_episode,
+                ol.notes
+            FROM sensor_readings sr
+            JOIN outcome_labels ol ON sr.id = ol.reading_id
+            ORDER BY sr.id DESC
+            LIMIT ?
+        """, (limit,))
+        rows = await cursor.fetchall()
+        results = []
+        for row in rows:
+            sensor = json.loads(row["sensor_data"])
+            risk   = json.loads(row["risk_data"])
+            readings = sensor.get("sensor_readings", {})
+            results.append({
+                "id":              row["id"],
+                "timestamp":       row["timestamp"],
+                "temperature":     readings.get("temperature"),
+                "humidity":        readings.get("humidity"),
+                "aqi":             readings.get("aqi"),
+                "heat_score":      risk.get("health_score"),
+                "heat_risk":       risk.get("heat_stress_risk"),
+                "respiratory_risk":risk.get("respiratory_risk"),
+                "had_episode":     bool(row["had_episode"]),
+            })
+        return results

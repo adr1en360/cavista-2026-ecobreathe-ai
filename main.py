@@ -1,10 +1,17 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from schemas import SensorPayload, SymptomEntry
+from schemas import SensorPayload, SymptomEntry, OutcomeLabel
 from risk_engine import assess_environment_risk
-from aqi_service import resolve_aqi_from_device, get_aqi_with_fallback
+from aqi_service import (
+    resolve_aqi_from_device,
+    get_aqi_with_fallback,
+    fetch_aqi_forecast,
+    DEFAULT_LAT,
+    DEFAULT_LON,
+)
 from database import (
     init_db,
     save_sensor_reading,
@@ -14,12 +21,10 @@ from database import (
     get_latest_symptom_log,
     save_aqi_cache,
     get_last_known_aqi,
+    save_outcome_label,
+    get_training_data,
 )
 
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,14 +54,6 @@ app.add_middleware(
 
 @app.post("/sensor-data", summary="Receive data from ESP32")
 async def receive_sensor_data(payload: SensorPayload, request: Request):
-    """
-    ESP32 hits this endpoint every 30-60 seconds.
-
-    AQI resolution order:
-        1. Device AQI is valid (1-400)  → use it, stamp source: device
-        2. Device AQI is flagged        → run fallback chain via aqi_service
-    """
-    # 1. Resolve AQI — validate device value or run fallback
     last_known = await get_last_known_aqi()
     aqi_info = await resolve_aqi_from_device(
         device_aqi=payload.aqi,
@@ -64,14 +61,11 @@ async def receive_sensor_data(payload: SensorPayload, request: Request):
         last_known=last_known,
     )
 
-    # 2. If we got a fresh Open-Meteo result, cache it for future fallbacks
     if aqi_info.get("source") == "open-meteo":
         await save_aqi_cache(aqi_info)
 
-    # 3. Pull latest symptom log
     latest_symptoms = await get_latest_symptom_log()
 
-    # 4. Run risk assessment with resolved AQI
     risk = assess_environment_risk(
         temperature=payload.temperature,
         humidity=payload.humidity,
@@ -79,10 +73,9 @@ async def receive_sensor_data(payload: SensorPayload, request: Request):
         symptoms=latest_symptoms,
     )
 
-    # 5. Build and save the full record
     record = {
-        "sensor_readings": payload.model_dump(),
-        "aqi_info":        aqi_info,
+        "sensor_readings":   payload.model_dump(),
+        "aqi_info":          aqi_info,
         "health_assessment": risk,
     }
     doc_id = await save_sensor_reading(record, risk)
@@ -91,21 +84,11 @@ async def receive_sensor_data(payload: SensorPayload, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# AQI endpoint — dashboard calls this independently
+# AQI endpoint
 # ---------------------------------------------------------------------------
 
 @app.post("/get-aqi", summary="Fetch AQI for a location")
 async def get_aqi(request: Request, latitude: float = None, longitude: float = None):
-    """
-    Dashboard calls this on page load.
-    Accepts optional GPS coordinates from the frontend.
-    Runs the full fallback chain if coordinates are missing or fail.
-    Frontend reads the source field to display the right label:
-        device      → reading from ESP32 sensor
-        open-meteo  → fetched from Open-Meteo API
-        last_known  → cached value, API was unreachable
-        unavailable → no data from any source
-    """
     last_known = await get_last_known_aqi()
     aqi_info = await get_aqi_with_fallback(
         lat=latitude,
@@ -113,26 +96,109 @@ async def get_aqi(request: Request, latitude: float = None, longitude: float = N
         request=request,
         last_known=last_known,
     )
-
-    # Cache any fresh Open-Meteo result
     if aqi_info.get("source") == "open-meteo":
         await save_aqi_cache(aqi_info)
-
     return aqi_info
 
 
 # ---------------------------------------------------------------------------
-# Symptom diary endpoint
+# Forecast endpoint — AI prevention feature
+# ---------------------------------------------------------------------------
+
+@app.get("/forecast", summary="6 hour air quality forecast with risk trajectory")
+async def get_forecast(latitude: float = None, longitude: float = None):
+    """
+    Fetches 6 hour AQI forecast and runs each hour through the risk engine.
+    Returns a risk trajectory — improving, stable, or worsening.
+    This is prevention not reaction: act before conditions deteriorate.
+    """
+    lat = latitude or DEFAULT_LAT
+    lon = longitude or DEFAULT_LON
+
+    forecast_data = await fetch_aqi_forecast(lat, lon)
+
+    if not forecast_data:
+        raise HTTPException(status_code=503, detail="Forecast data unavailable.")
+
+    # Get current reading for temperature and humidity context
+    current = await get_latest_sensor_reading()
+    current_temp     = current["sensor_readings"].get("temperature", 30) if current else 30
+    current_humidity = current["sensor_readings"].get("humidity", 70)    if current else 70
+
+    forecast_risk = []
+    for hour in forecast_data:
+        if hour["aqi"] is not None:
+            risk = assess_environment_risk(
+                temperature=current_temp,
+                humidity=current_humidity,
+                aqi=hour["aqi"],
+            )
+            forecast_risk.append({
+                "time":             hour["time"],
+                "aqi":              hour["aqi"],
+                "pm2_5":            hour["pm2_5"],
+                "pm10":             hour["pm10"],
+                "health_score":     risk["health_score"],
+                "overall_status":   risk["overall_status"],
+                "respiratory_risk": risk["respiratory_risk"],
+            })
+
+    # Determine trajectory from first to last hour
+    trajectory = "Stable"
+    if len(forecast_risk) >= 2:
+        diff = forecast_risk[-1]["health_score"] - forecast_risk[0]["health_score"]
+        if diff > 10:
+            trajectory = "Improving"
+        elif diff < -10:
+            trajectory = "Worsening"
+
+    return {
+        "trajectory":     trajectory,
+        "forecast_hours": forecast_risk,
+        "coordinates":    {"latitude": lat, "longitude": lon},
+        "generated_at":   datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Symptom diary
 # ---------------------------------------------------------------------------
 
 @app.post("/symptom-diary", summary="User logs current symptoms")
 async def log_symptoms(entry: SymptomEntry):
-    """
-    Receives structured symptom entry from the dashboard.
-    Stored independently — factored into the next sensor reading automatically.
-    """
     doc_id = await save_symptom_log(entry.model_dump())
     return {"status": "success", "id": doc_id}
+
+
+# ---------------------------------------------------------------------------
+# Outcome label — XGBoost training data collection
+# ---------------------------------------------------------------------------
+
+@app.post("/outcome", summary="User labels whether an episode occurred")
+async def label_outcome(entry: OutcomeLabel):
+    """
+    User marks whether they had an asthma episode after a reading.
+    Every labelled record becomes a training data point for XGBoost.
+    """
+    doc_id = await save_outcome_label(
+        reading_id=entry.reading_id,
+        had_episode=entry.had_episode,
+        notes=entry.notes,
+    )
+    return {"status": "success", "id": doc_id}
+
+
+@app.get("/training-data", summary="Export labelled records for XGBoost training")
+async def export_training_data():
+    """
+    Returns all readings that have been labelled with outcomes.
+    This is the dataset the XGBoost model trains on.
+    """
+    records = await get_training_data(limit=500)
+    return {
+        "count":   len(records),
+        "records": records,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +207,6 @@ async def log_symptoms(entry: SymptomEntry):
 
 @app.get("/latest-data", summary="Full latest record for the dashboard")
 async def get_latest_data():
-    """
-    Returns the most recent sensor reading with full risk assessment and AQI info.
-    """
     doc = await get_latest_sensor_reading()
     if not doc:
         raise HTTPException(status_code=404, detail="No sensor data received yet.")
@@ -152,10 +215,6 @@ async def get_latest_data():
 
 @app.get("/risk-level", summary="Lightweight risk summary for frequent polling")
 async def get_risk_level():
-    """
-    Smaller payload than /latest-data.
-    Poll this frequently to update the dashboard risk badge.
-    """
     doc = await get_latest_sensor_reading()
     if not doc:
         raise HTTPException(status_code=404, detail="No data yet.")
@@ -173,9 +232,6 @@ async def get_risk_level():
 
 @app.get("/history", summary="Trend data for dashboard charts")
 async def get_history():
-    """
-    Returns last 50 readings oldest-first so charts render correctly.
-    """
     readings = await get_reading_history(limit=50)
     return {"readings": readings}
 
